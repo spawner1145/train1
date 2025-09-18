@@ -33,7 +33,9 @@ def setup(fabric: pl.Fabric, config: OmegaConf) -> tuple:
                                    index_file=config.dataset.index_file,
                                    multireso=config.dataset.multireso,
                                    batch_size=config.trainer.batch_size,
-                                   world_size=world_size
+                                   world_size=world_size,
+                                   use_loss_mask=getattr(config.dataset, 'use_loss_mask', False),
+                                   loss_mask_key=getattr(config.dataset, 'loss_mask_key', None)
                                    )
 
     if config.dataset.multireso:
@@ -154,7 +156,7 @@ class SupervisedFineTune(Lumina2Model):
         )
 
         # 对图像进行VAE编码
-        latents = self.encode_images(images)  # [B, C, H, W]
+        latents = self.encode_images(images)  # list of [C, H, W]
 
         # muti resolution
         # if len(latents.shape) == 3:
@@ -163,6 +165,19 @@ class SupervisedFineTune(Lumina2Model):
         # latents_mb_256 = [self.apply_average_pool(x, 4) for x in latents]
 
         model_kwargs = dict(cap_feats=prompt_embeds, cap_mask=prompt_masks)
+
+        # Optional loss mask: expects image-space mask in batch; downsample to latent resolution (divide by 8) and pass
+        if "loss_mask" in batch:
+            mask_img = batch["loss_mask"].to(self.target_device)  # [B,1,H,W]
+            # Determine target sizes from latents list
+            target_sizes = [(x.shape[-2], x.shape[-1]) for x in latents]
+            masks = []
+            for i, (h, w) in enumerate(target_sizes):
+                # mask is in [0,1]; downsample with area to avoid aliasing
+                mi = F.interpolate(mask_img[i:i+1], size=(h, w), mode="area")
+                masks.append(mi[0])  # [1,h,w]
+            model_kwargs["loss_mask"] = masks
+
         loss_dict = trans.training_losses(self.model, latents, model_kwargs)
         # loss_dict_256 = trans.training_losses(self.model, latents_mb_256, model_kwargs)
 

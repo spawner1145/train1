@@ -54,6 +54,9 @@ dataset:
   multireso: true
   num_workers: 8
   random_flip: false
+  # loss mask options:
+  # use_loss_mask: true
+  # loss_mask_key: "mask"  # the column name in arrow file for mask image
 
 optimizer:
   name: torch.optim.AdamW

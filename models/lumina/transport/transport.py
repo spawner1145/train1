@@ -173,6 +173,8 @@ class Transport:
             model_kwargs = {}
         t, x0, x1 = self.sample(x1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
+        # Extract optional loss mask (not a model input)
+        loss_mask = model_kwargs.pop("loss_mask", None) if model_kwargs is not None else None
         if "cond" in model_kwargs:
             conds = model_kwargs.pop("cond")
             xt = [th.cat([x, cond], dim=0) if cond is not None else x for x, cond in zip(xt, conds)]
@@ -188,12 +190,50 @@ class Transport:
                     assert (
                         model_output[i].shape == ut[i].shape == x1[i].shape
                     ), f"{model_output[i].shape} {ut[i].shape} {x1[i].shape}"
-                terms["task_loss"] = th.stack(
-                    [((ut[i] - model_output[i]) ** 2).mean() for i in range(B)],
-                    dim=0,
-                )
+                # Optional per-sample weighting mask at latent resolution
+                if loss_mask is not None:
+                    # loss_mask can be list of [1,H,W] or tensor [B,1,H,W]
+                    if isinstance(loss_mask, (list, tuple)):
+                        masks = loss_mask
+                    else:
+                        masks = [loss_mask[i] for i in range(B)]
+                    losses = []
+                    eps = 1e-6
+                    for i in range(B):
+                        err2 = (ut[i] - model_output[i]) ** 2  # [C,H,W]
+                        m = masks[i]
+                        if m.ndim == 2:
+                            m = m.unsqueeze(0)
+                        # broadcast to channels
+                        if err2.dim() == 3 and m.size(0) == 1:
+                            m_bc = m
+                        else:
+                            m_bc = m
+                        # weighted mean across C,H,W
+                        num = (err2 * m_bc).sum()
+                        den = m_bc.sum() * (err2.size(0) if err2.dim() == 3 else 1)
+                        loss_i = num / (den + eps)
+                        losses.append(loss_i)
+                    terms["task_loss"] = th.stack(losses, dim=0)
+                else:
+                    terms["task_loss"] = th.stack(
+                        [((ut[i] - model_output[i]) ** 2).mean() for i in range(B)],
+                        dim=0,
+                    )
             else:
-                terms["task_loss"] = mean_flat(((model_output - ut) ** 2))
+                if loss_mask is not None:
+                    m = loss_mask
+                    if m.ndim == 3 and m.size(0) == 1:
+                        m_bc = m
+                    else:
+                        m_bc = m
+                    err2 = (model_output - ut) ** 2
+                    eps = 1e-6
+                    num = (err2 * m_bc).sum()
+                    den = m_bc.sum() * (err2.size(0) if err2.dim() == 3 else 1)
+                    terms["task_loss"] = num / (den + eps)
+                else:
+                    terms["task_loss"] = mean_flat(((model_output - ut) ** 2))
         else:
             raise NotImplementedError
 

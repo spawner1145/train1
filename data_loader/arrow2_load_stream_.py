@@ -1,6 +1,7 @@
 import pickle
 import random
 from pathlib import Path
+from typing import Optional
 import ast
 import numpy as np
 import re
@@ -35,6 +36,9 @@ class TextImageArrowStream(Dataset):
                  uncond_p_t5=0.0,
                  rank=0,
                  dtype=torch.float32,
+                 # mask-loss options
+                 use_loss_mask: bool = False,
+                 loss_mask_key: Optional[str] = None,
                  **kwarges
                  ):
         self.args = args
@@ -65,14 +69,18 @@ class TextImageArrowStream(Dataset):
         self.merge_src_cond = merge_src_cond
 
         assert isinstance(resolution, int), f"resolution must be an integer, got {resolution}"
-        self.flip_norm = T.Compose(
+        # Use deterministic horizontal flip so image and mask can share the same decision
+        self.to_tensor_norm = T.Compose(
             [
-                T.RandomHorizontalFlip() if self.random_flip else T.Lambda(lambda x: x),
                 T.ToTensor(),
                 T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
-                
             ]
         )
+        self.to_tensor = T.ToTensor()
+
+        # mask-loss
+        self.use_loss_mask = bool(use_loss_mask)
+        self.loss_mask_key = loss_mask_key
         # tag_edit
         self.replace_to_zn = 0.2
         self.copyright_dropout = 0.05
@@ -84,7 +92,7 @@ class TextImageArrowStream(Dataset):
             self.log_fn("Enable merging src condition: (oriW, oriH) --> ((WH)**0.5, (WH)**0.5)")
 
         self.log_fn("Enable image_meta_size condition (original_size, target_size, crop_coords)")
-        self.log_fn(f"Image_transforms: {self.flip_norm}")
+        self.log_fn(f"Image_transforms: ToTensor+Normalize, random_flip={self.random_flip}")
 
     def load_index(self):
         multireso = self.multireso
@@ -145,26 +153,89 @@ class TextImageArrowStream(Dataset):
         crops_coords_top_left = (x_start, y_start)
         return image_crop, crops_coords_top_left
 
+    @staticmethod
+    def resize_and_crop_with_coords(image, origin_size, target_size, coords=None):
+        """
+        Resize keeping aspect ratio and crop to target_size. If coords provided, use them; otherwise choose random.
+        Returns cropped_image, coords_used
+        """
+        aspect_ratio = float(origin_size[0]) / float(origin_size[1])
+        if origin_size[0] < origin_size[1]:
+            new_width = target_size[0]
+            new_height = int(new_width / aspect_ratio)
+        else:
+            new_height = target_size[1]
+            new_width = int(new_height * aspect_ratio)
+
+        image = image.resize((new_width, new_height), Image.LANCZOS)
+
+        if coords is None:
+            if new_width > target_size[0]:
+                x_start = random.randint(0, new_width - target_size[0])
+                y_start = 0
+            else:
+                x_start = 0
+                y_start = random.randint(0, new_height - target_size[1])
+        else:
+            x_start, y_start = coords
+
+        image_crop = image.crop((x_start, y_start, x_start + target_size[0], y_start + target_size[1]))
+        crops_coords_top_left = (x_start, y_start)
+        return image_crop, crops_coords_top_left
+
     def get_style(self, index):
         "Here we use a default learned embedder layer for future extension."
         style = 0
         return style
 
     def get_image_with_hwxy(self, index, image_key="image"):
-
+        """
+        Load image and apply resize/crop/optional flip; If use_loss_mask enabled and loss_mask_key provided,
+        load corresponding mask with identical geometric transforms.
+        """
         image = self.get_raw_image(index, image_key=image_key)
         origin_size = image.size
 
+        # Decide target size
+        # Prepare optional mask image early
+        mask_img = None
+        if self.use_loss_mask and self.loss_mask_key:
+            try:
+                mask_img = self.get_raw_image(index, image_key=self.loss_mask_key)
+            except Exception as e:
+                self.log_fn(f"load mask failed at index {index}: {e}; will fallback to ones later")
+                mask_img = None
+
         if self.multireso:
             target_size = self.index_manager.get_target_size(index)
-            
-            image, crops_coords_top_left = self.index_manager.resize_and_crop(
-                image, target_size, resample=Image.LANCZOS, crop_type='random')
-            image_tensor = self.flip_norm(image)
+            # If mask available, crop both with same params using ArrowIndexV2 util
+            if mask_img is not None:
+                (image_crop, mask_crop), crops_coords_top_left = ArrowIndexV2.resize_and_crop(
+                    (image, mask_img), target_size, resample=Image.LANCZOS, crop_type='random', is_list=True
+                )
+            else:
+                image_crop, crops_coords_top_left = self.index_manager.resize_and_crop(
+                    image, target_size, resample=Image.LANCZOS, crop_type='random')
+                mask_crop = None
         else:
             target_size = (self.resolution, self.resolution)
-            image_crop, crops_coords_top_left = self.random_crop_image(image, origin_size, target_size)
-            image_tensor = self.flip_norm(image_crop)
+            if mask_img is not None:
+                (image_crop, mask_crop), crops_coords_top_left = ArrowIndexV2.resize_and_crop(
+                    (image, mask_img), target_size, resample=Image.LANCZOS, crop_type='random', is_list=True
+                )
+            else:
+                # Do resize and random-crop to get coords, so mask can share it
+                image_crop, crops_coords_top_left = self.resize_and_crop_with_coords(image, origin_size, target_size)
+                mask_crop = None
+
+        # Deterministic horizontal flip decision shared by image & mask
+        do_flip = False
+        if self.random_flip:
+            do_flip = random.random() < 0.5
+        if do_flip:
+            image_crop = TF.hflip(image_crop)
+
+        image_tensor = self.to_tensor_norm(image_crop)
 
         if self.random_shrink_size_cond:
             origin_size = (1024 if origin_size[0] < 1024 else origin_size[0],
@@ -184,6 +255,30 @@ class TextImageArrowStream(Dataset):
 
         style = self.get_style(index)
         kwargs['style'] = style
+
+        # When enabled, load and transform mask with identical params
+        if self.use_loss_mask and self.loss_mask_key:
+            try:
+                if mask_crop is None:
+                    # load and crop using same coords if previous failed to fetch mask earlier
+                    mask_img2 = self.get_raw_image(index, image_key=self.loss_mask_key)
+                    mask_origin_size = mask_img2.size
+                    mask_crop, _ = self.resize_and_crop_with_coords(mask_img2, mask_origin_size, target_size, coords=crops_coords_top_left)
+                if do_flip:
+                    mask_crop = TF.hflip(mask_crop)
+                # Convert to single-channel tensor in [0,1]
+                # If mask is RGB, ToTensor will average per channel? No, it returns 3xHxW; we take luminance later
+                mask_t = self.to_tensor(mask_crop)
+                if mask_t.ndim == 3 and mask_t.size(0) > 1:
+                    # Convert RGB to grayscale by luminosity
+                    r, g, b = mask_t[0], mask_t[1], mask_t[2]
+                    mask_t = (0.299 * r + 0.587 * g + 0.114 * b).unsqueeze(0)
+                elif mask_t.ndim == 2:
+                    mask_t = mask_t.unsqueeze(0)
+                kwargs['loss_mask'] = mask_t.clamp(0.0, 1.0)
+            except Exception as e:
+                self.log_fn(f"load mask failed at index {index}: {e}; use default ones mask")
+                kwargs['loss_mask'] = torch.ones(1, target_size[1], target_size[0])
 
         return image_tensor, kwargs
 
@@ -537,15 +632,17 @@ class TextImageArrowStream(Dataset):
         # crops_coords_top_left = torch.asarray(crops_coords_top_left)
 
 
-        return {
+        ret = {
             "prompts": text,
             "pixels": pixel,
             "is_latent": False,
-            # "target_size_as_tuple": target_size,
-            # "original_size_as_tuple": origin_size,
-            # "crop_coords_top_left": crops_coords_top_left,
-            # "extras": extras,
-            }
+        }
+
+        # Attach mask if available
+        if self.use_loss_mask and 'loss_mask' in kwargs:
+            ret["loss_mask"] = kwargs['loss_mask']
+
+        return ret
 
     def __len__(self):
         return len(self.index_manager)
